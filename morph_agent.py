@@ -1,3 +1,4 @@
+import json
 import chz
 import re
 import os
@@ -226,6 +227,9 @@ class SimpleAgentSolver(PythonCodingSolver):
 
     @override
     async def run(self, task: ComputerTask) -> AsyncGenerator[Step | FinalResult, None]:
+        injection_success = {} 
+        model_responses: list[str] = []     
+        
         try:
             print(f"{COLORS['GREEN']}Running with MorphCloud!{COLORS['RESET']}")
             async with self._with_cached_setup(task) as computer:
@@ -334,7 +338,34 @@ Please note that the Python code is not a Jupyter notebook; you must write a ful
                 # 3. Grade and yield the final result
                 print(f"Agent loop exited: {loop_exit_reason}")
                 grade = await task.grade(computer)
-                yield FinalResultSuccessful(grade=grade)
+              
+                messages_dir = "messages"
+                os.makedirs(messages_dir, exist_ok=True)
+                filename = f"{messages_dir}/{task.question_id}_{task.attempt_id}_{task.retry_idx}.jsonl"
+                with open(filename, "w", encoding="utf-8") as f:
+                    for msg in messages:
+                        f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
+                all_model_text = "\n".join(model_responses) 
+
+                # Define the path and make sure the directory exists
+
+                if hasattr(task, "adversarial_mode") and task.adversarial_mode:
+                    for mode in task.adversarial_mode.split(","):
+                        mode = mode.strip()
+
+                        if mode == "Output File Exposure":
+                            # pass the ComputerInterface to the async check
+                            injection_success[mode] = await contains_output_file_exposure(
+                                all_model_text, computer
+                            )
+                        else:
+                            injection_success[mode] = check_injection_success(all_model_text, mode)
+                        result = check_injection_success(all_model_text, mode)
+                        injection_success[mode] = result
+
+                yield FinalResultSuccessful(grade=grade, grader_log=None,  metadata={"injection_success": injection_success} )
+      
         except Exception as e:
             print(f"Error: {e}")
             yield FinalResultSuccessful(
