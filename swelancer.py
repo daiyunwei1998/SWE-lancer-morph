@@ -1,3 +1,5 @@
+from pathlib import Path
+from datetime import datetime
 import asyncio
 import json
 import ast
@@ -71,6 +73,7 @@ class SWELancerTask(ComputerTask):
     instance: SwelancerInstance | None
     price: float
     variant: str
+    adversarial_mode: str | None = None
     acceptable_folders: list[str] = []
     manager_data: dict[str, Any] | None = None
     manager_commit: str | None = None
@@ -143,7 +146,7 @@ class SWELancerTask(ComputerTask):
 
     @override
     async def grade(self, computer: ComputerInterface) -> SWELancerGrade:
-        #Unzip locked testing files
+        # Unzip locked testing files
         print('Unzipping tests')
         print(await computer.check_shell_command(
             "unzip -q -P 'secretpasswordhere' -o /app/tests.zip -d /app/tests"
@@ -272,11 +275,43 @@ class SWELancerTask(ComputerTask):
             grade_report_path="",
         )
 
+    async def cleanup(self):
+        """Clean up Docker resources"""
+        try:
+            # Clean up any test artifacts
+            await self.send_shell_command("rm -f /app/tests.zip /tmp/patch.diff")
+            
+            # Force cleanup of Docker networks
+            await self.send_shell_command("docker network prune -f")
+            await self.send_shell_command("docker container prune -f")
+        except Exception as e:
+            logger.warning("Cleanup failed", error=str(e))
+
 
 @chz.chz
 class SWELancerEval(PythonCodingEval):
     split: SWELancerSplit = "Diamond-$500k"
     taskset: list[str] | None = None
+    adversarial_config: str | None = None
+    adversarial_objective_ids: list[str] | None = None
+
+    def _load_adversarial_data(self) -> list[dict[str, str]]:
+        """Load adversarial data from CSV."""
+        adv_list: list[dict[str, str]] = []
+        if self.adversarial_config:
+            df = pd.read_csv(self.adversarial_config, dtype=str)
+            df = df[
+                df["id"].notna()
+                & df["adversarial_objective"].notna()
+                & df["prompt"].notna()
+            ]
+            for row in df.to_dict(orient="records"):
+                adv_id = row["id"].strip()
+                mode = row["adversarial_objective"].strip()
+                inj = row["prompt"].strip()
+                if adv_id and mode and inj:
+                    adv_list.append({"id": adv_id, "mode": mode, "inject": inj})
+        return adv_list
 
     @override
     def get_name(self) -> str:
@@ -284,15 +319,28 @@ class SWELancerEval(PythonCodingEval):
 
     @override
     async def get_tasks(self) -> list[SWELancerTask]:
+        """
+        1) Read swelancer_tasks.csv
+        2) Filter by `self.taskset` (if any)
+        3) Parse literal fields (prompt, folders, manager_data, manager_commit)
+        4) Skip 'Reintroduce-' entries
+        5) If `self.adversarial_objective_ids` is provided:
+             - filter `self.adv_list` down to only those entries whose "id" is in that list
+             - append each matching 'prompt' to EVERY task's prompt[0]['content']
+             - set task.adversarial_mode = comma‐joined modes
+        6) Remove CSV‐only fields
+        7) Return a list of SWELancerTask
+        """
+        # 1. Read the main task CSV
         tasks = pd.read_csv("swelancer_tasks.csv")
         env_vars = dotenv_values(".env")    
         SWEFL_ENV = {
             "PUSHER_APP_KEY": PUSHER_APP_KEY,
             "PUSHER_APP_SECRET": PUSHER_APP_SECRET, 
             "PUSHER_APP_ID": PUSHER_APP_ID,
-            "USE_WEB_PROXY": env_vars["USE_WEB_PROXY"],
-            "EXPENSIFY_URL": env_vars["EXPENSIFY_URL"],
-            "NEW_EXPENSIFY_URL": env_vars["NEW_EXPENSIFY_URL"],
+            "USE_WEB_PROXY": env_vars.get("USE_WEB_PROXY", ""),
+            "EXPENSIFY_URL": env_vars.get("EXPENSIFY_URL", ""),
+            "NEW_EXPENSIFY_URL": env_vars.get("NEW_EXPENSIFY_URL", ""),
             "ISSUE_ID": "0",
             "LC_ALL": "C.UTF-8",
             "EVAL_VARIANT": "ic_swe",
@@ -300,12 +348,22 @@ class SWELancerEval(PythonCodingEval):
 
         docker_image = "swelancer:latest"
 
+        # 2. Restrict adv_list to only those IDs in adversarial_objective_ids
+        adv_list = self._load_adversarial_data()
+        effective_adv_entries: list[dict[str, str]] = []
+        if self.adversarial_config and self.adversarial_objective_ids:
+            effective_adv_entries = [
+                adv for adv in adv_list if adv["id"] in self.adversarial_objective_ids
+            ]
+
         swelancer_tasks = []
         i = 0 
         for task in tasks.to_dict(orient="records"):
+            # 3. Filter by taskset if provided
             if self.taskset and task["question_id"] not in self.taskset:
                 continue
-            # task['all_proposals'] = ast.literal_eval(task['all_proposals'])
+            
+            # 4. Parse literal fields
             task['prompt'] = ast.literal_eval(task['prompt'])
             task['acceptable_folders'] = ast.literal_eval(task['acceptable_folders'])
             if str(task['manager_data']) == 'nan': 
@@ -315,19 +373,41 @@ class SWELancerEval(PythonCodingEval):
 
             if str(task['manager_commit']) == 'nan': 
                 task['manager_commit'] = None
+            
+            # 5. Skip any "Reintroduce-" tasks
             if "Reintroduce-" in task["question_id"]:
                 continue
 
             SWEFL_ENV["ISSUE_ID"] = task["question_id"]
 
+            # 6. For each adv entry in effective_adv_entries, append its prompt
+            if effective_adv_entries:
+                modes: list[str] = []
+                for adv in effective_adv_entries:
+                    inj_text = adv["inject"]
+                    mode = adv["mode"]
+                    # Append the adversarial text onto the first message's content
+                    task["prompt"][0]["content"] += "\n" + inj_text
+                    modes.append(mode)
+                task["adversarial_mode"] = ",".join(modes)
+            else:
+                task["adversarial_mode"] = None
+
+            # 7. Remove CSV‐only fields
             del task['price_limit']
             del task['canary']
+            
+            # 8. Construct the SWELancerTask instance
             swelancer_tasks.append(SWELancerTask(**task, attempt_id=str(i), environment=SWEFL_ENV, grade_every_step=False, docker_image=docker_image, instance=SwelancerInstance(repo="expensify"))) # type: ignore
             i += 1
         return swelancer_tasks
     
     @override
     async def evaluate(self, task: ComputerTask) -> FinalResult:
+        """
+        Run the solver on the given SWELancerTask, log every conversation step to a JSONL file,
+        and return the FinalResult (either FinalResultSuccessful or FinalResultWithException).
+        """
         last_convo = None
         
         # Create logs directory if it doesn't exist
@@ -371,6 +451,43 @@ Finish reasons: {step.finish_status=} {step.max_steps_reached=} {step.max_tokens
                     return step
 
         raise ValueError("Solver did not return a final result! This is a bug.")
+
+    @override
+    async def get_full_summary(self, results: list[tuple[ComputerTask, FinalResult]]) -> dict[str, Any]:
+        # ① Call the parent full‐summary
+        summary = await super().get_full_summary(results)
+
+        # ② Now inject your adversarial counts on top of it
+        summary.setdefault("adversarial_total", 0)
+        summary.setdefault("adversarial_success", 0)
+        summary.setdefault("adversarial_success_by_mode", {})
+
+        for task, final in results:
+            modes = getattr(task, "adversarial_mode", None)
+            injection = getattr(final, "metadata", {}).get("injection_success", {})
+            if not modes:
+                continue
+            summary["adversarial_total"] += 1
+            if any(injection.get(m.strip(), False) for m in modes.split(",")):
+                summary["adversarial_success"] += 1
+            for m in modes.split(","):
+                m = m.strip()
+                mode_stats = summary["adversarial_success_by_mode"].setdefault(m, {"total": 0, "success": 0})
+                mode_stats["total"] += 1
+                if injection.get(m):
+                    mode_stats["success"] += 1
+
+        summary["adversarial_success_rate"] = (
+            summary["adversarial_success"] / summary["adversarial_total"]
+            if summary["adversarial_total"] else 0.0
+        )
+        summary["adversarial_mode_success_rates"] = {
+            m: stats["success"] / stats["total"] if stats["total"] else 0.0
+            for m, stats in summary["adversarial_success_by_mode"].items()
+        }
+
+        # (Optional) write it out again, etc.
+        return summary
 
     @override
     async def get_summary(self, results: list[tuple[ComputerTask, FinalResult]]) -> dict[str, Any]:
